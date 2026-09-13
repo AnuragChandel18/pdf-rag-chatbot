@@ -164,45 +164,31 @@ def extract_pdf(pdf_bytes: bytes):
     return pages, len(reader.pages)
 
 
-def embed_texts(texts: list, api_key: str) -> np.ndarray:
+def embed_texts(texts: list, client) -> np.ndarray:
     """
-    Create Gemini embeddings using the Gemini API REST endpoint.
-    The API key is sent securely in the x-goog-api-key header.
+    Create Gemini embeddings using the official google-genai SDK.
+    This avoids direct REST authentication issues.
     """
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{EMBED_MODEL}:batchEmbedContents"
-    )
-    all_embs = []
-    batch_size = 100
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        payload = json.dumps({
-            "requests": [
-                {"model": f"models/{EMBED_MODEL}", "content": {"parts": [{"text": t}]}}
-                for t in batch
-            ]
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            method="POST",
+    try:
+        result = client.models.embed_content(
+            model=EMBED_MODEL,
+            contents=texts,
+            config=types.EmbedContentConfig(
+                output_dimensionality=EMBED_DIM,
+            ),
         )
-        try:
-            with urllib.request.urlopen(req) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"Embedding API error {e.code}: {e.read().decode()}") from e
-        for emb_obj in data["embeddings"]:
-            all_embs.append(emb_obj["values"])
-    return np.array(all_embs, dtype="float32")
+    except Exception as e:
+        raise RuntimeError(f"Embedding API error: {e}") from e
 
+    if not result.embeddings:
+        raise RuntimeError("Embedding API returned no embeddings.")
 
-def build_vector_store(pdf_bytes: bytes, api_key: str):
+    return np.array(
+        [embedding.values for embedding in result.embeddings],
+        dtype="float32",
+    )
+
+def build_vector_store(pdf_bytes: bytes, client):
     pages, total_pages = extract_pdf(pdf_bytes)
     chunks, meta = [], []
     for page_num, page_text in pages:
@@ -214,7 +200,7 @@ def build_vector_store(pdf_bytes: bytes, api_key: str):
         return None, 0, 0
 
     with st.spinner(f"🔢 Embedding {len(chunks)} chunks with Gemini…"):
-        embeddings = embed_texts(chunks, api_key)
+        embeddings = embed_texts(chunks, client)
 
     faiss.normalize_L2(embeddings)
     index = faiss.IndexFlatIP(embeddings.shape[1])
@@ -223,8 +209,8 @@ def build_vector_store(pdf_bytes: bytes, api_key: str):
     return {"index": index, "chunks": chunks, "meta": meta}, total_pages, len(chunks)
 
 
-def retrieve(query: str, vector_store: dict, api_key: str, top_k=TOP_K):
-    q_emb = embed_texts([query], api_key)
+def retrieve(query: str, vector_store: dict, client, top_k=TOP_K):
+    q_emb = embed_texts([query], client)
     faiss.normalize_L2(q_emb)
     scores, idxs = vector_store["index"].search(q_emb, top_k)
     results = []
@@ -321,7 +307,7 @@ with st.sidebar:
                 try:
                     client = get_client(st.session_state.api_key)
                     pdf_bytes = uploaded_file.read()
-                    store, pages, chunks = build_vector_store(pdf_bytes, st.session_state.api_key)
+                    store, pages, chunks = build_vector_store(pdf_bytes, client)
                     if store:
                         st.session_state.vector_store = store
                         st.session_state.pdf_name     = uploaded_file.name
@@ -463,7 +449,7 @@ if send and user_query.strip():
         context = []
 
         with st.spinner("🔍 Searching document…"):
-            context = retrieve(user_query, st.session_state.vector_store, st.session_state.api_key)
+            context = retrieve(user_query, st.session_state.vector_store, client)
 
         if not context:
             answer  = "I couldn't find information about that in the uploaded PDF. Please try rephrasing or check that this topic is covered."
@@ -503,7 +489,7 @@ if st.session_state.vector_store and not st.session_state.chat_history:
                     {"role": "user", "content": q, "sources": []}
                 )
                 client  = get_client(st.session_state.api_key)
-                context = retrieve(q, st.session_state.vector_store, st.session_state.api_key)
+                context = retrieve(q, st.session_state.vector_store, client)
                 if context:
                     prompt = build_prompt(q, context, st.session_state.pdf_name)
                     try:
