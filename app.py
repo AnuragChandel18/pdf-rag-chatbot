@@ -115,8 +115,8 @@ st.markdown("""
 CHUNK_SIZE   = 600   # chars per chunk
 CHUNK_OVERLAP= 100
 TOP_K        = 5
-GEMINI_MODEL = "gemini-2.0-flash"
-EMBED_MODEL  = "text-embedding-004"   # Gemini embedding model (no models/ prefix)
+GEMINI_MODEL = "gemini-3.6-flash"
+EMBED_MODEL = "gemini-embedding-001"   # Gemini embedding model (no models/ prefix)
 EMBED_DIM    = 768
 
 # ──────────────────────────────────────────────
@@ -171,7 +171,7 @@ def embed_texts(texts: list, api_key: str) -> np.ndarray:
     so we call the stable v1 REST API directly instead.
     """
     url = (
-        f"https://generativelanguage.googleapis.com/v1/models/"
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{EMBED_MODEL}:batchEmbedContents?key={api_key}"
     )
     all_embs = []
