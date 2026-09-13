@@ -279,20 +279,28 @@ with st.sidebar:
 
     # API Key
     st.markdown("<div class='section-header'>🔑 API Configuration</div>", unsafe_allow_html=True)
+
+try:
+    secret_api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    secret_api_key = ""
+
+if secret_api_key:
+    st.session_state.api_key = secret_api_key
+    st.success("✅ API configured", icon="🔑")
+else:
     api_input = st.text_input(
         "Google AI Studio API Key",
         type="password",
         placeholder="AIza…",
         value=st.session_state.api_key,
-        help="Get your key at https://aistudio.google.com/apikey",
+        help="Enter your Gemini API key",
     )
     if api_input != st.session_state.api_key:
         st.session_state.api_key = api_input
 
-    if st.session_state.api_key:
-        st.success("✅ API key saved", icon="🔑")
-    else:
-        st.warning("Enter your Gemini API key to start", icon="⚠️")
+if not st.session_state.api_key:
+    st.warning("Enter your Gemini API key to start", icon="⚠️")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
