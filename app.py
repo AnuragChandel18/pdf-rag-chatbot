@@ -1,15 +1,14 @@
 import streamlit as st
 import os
-import json
+import re
 import numpy as np
-import urllib.request
-import urllib.error
 from io import BytesIO
 
 import faiss
 from pypdf import PdfReader
 from google import genai
 from google.genai import types
+from sentence_transformers import SentenceTransformer
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -112,12 +111,12 @@ st.markdown("""
 # ──────────────────────────────────────────────
 # CONSTANTS
 # ──────────────────────────────────────────────
-CHUNK_SIZE   = 600   # chars per chunk
-CHUNK_OVERLAP= 100
-TOP_K        = 5
+CHUNK_SIZE = 1600
+CHUNK_OVERLAP = 200
+TOP_K = 6
+PAGE_NEARBY = 1
 GEMINI_MODEL = "gemini-3.6-flash"
-EMBED_MODEL = "gemini-embedding-001"   # Gemini embedding model (no models/ prefix)
-EMBED_DIM    = 768
+LOCAL_EMBED_MODEL = "all-MiniLM-L6-v2"
 
 # ──────────────────────────────────────────────
 # SESSION STATE
@@ -144,13 +143,23 @@ def get_client(api_key: str):
 
 
 def chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    chunks, start = [], 0
+    """Split text into overlapping chunks without creating unnecessary chunks."""
+    chunks = []
+    start = 0
+    step = max(1, size - overlap)
+
     while start < len(text):
         end = min(start + size, len(text))
-        c = text[start:end].strip()
-        if c:
-            chunks.append(c)
-        start += size - overlap
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= len(text):
+            break
+
+        start += step
+
     return chunks
 
 
@@ -164,33 +173,31 @@ def extract_pdf(pdf_bytes: bytes):
     return pages, len(reader.pages)
 
 
-def embed_texts(texts: list, client) -> np.ndarray:
-    """
-    Create Gemini embeddings using the official google-genai SDK.
-    This avoids direct REST authentication issues.
-    """
-    try:
-        result = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=texts,
-            config=types.EmbedContentConfig(
-                output_dimensionality=EMBED_DIM,
-            ),
-        )
-    except Exception as e:
-        raise RuntimeError(f"Embedding API error: {e}") from e
+@st.cache_resource
+def get_embedding_model():
+    """Load the local embedding model once per Streamlit process."""
+    return SentenceTransformer(LOCAL_EMBED_MODEL)
 
-    if not result.embeddings:
-        raise RuntimeError("Embedding API returned no embeddings.")
 
-    return np.array(
-        [embedding.values for embedding in result.embeddings],
-        dtype="float32",
+def embed_texts(texts: list, client=None) -> np.ndarray:
+    """Create embeddings locally; Gemini is not used for PDF embeddings."""
+    if not texts:
+        return np.empty((0, 384), dtype="float32")
+
+    model = get_embedding_model()
+    embeddings = model.encode(
+        texts,
+        batch_size=32,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
     )
+    return np.asarray(embeddings, dtype="float32")
 
-def build_vector_store(pdf_bytes: bytes, client):
+def build_vector_store(pdf_bytes: bytes, client=None):
     pages, total_pages = extract_pdf(pdf_bytes)
     chunks, meta = [], []
+
     for page_num, page_text in pages:
         for c in chunk_text(page_text):
             chunks.append(c)
@@ -199,28 +206,157 @@ def build_vector_store(pdf_bytes: bytes, client):
     if not chunks:
         return None, 0, 0
 
-    with st.spinner(f"🔢 Embedding {len(chunks)} chunks with Gemini…"):
-        embeddings = embed_texts(chunks, client)
+    with st.spinner(f"🔢 Creating local embeddings for {len(chunks)} chunks…"):
+        embeddings = embed_texts(chunks)
 
-    faiss.normalize_L2(embeddings)
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
-    return {"index": index, "chunks": chunks, "meta": meta}, total_pages, len(chunks)
+    return {"index": index, "chunks": chunks, "meta": meta, "total_pages": total_pages}, total_pages, len(chunks)
 
 
-def retrieve(query: str, vector_store: dict, client, top_k=TOP_K):
-    q_emb = embed_texts([query], client)
-    faiss.normalize_L2(q_emb)
-    scores, idxs = vector_store["index"].search(q_emb, top_k)
+def is_overview_question(query: str) -> bool:
+    q = query.lower().strip()
+    phrases = (
+        "what is this document about",
+        "what is the document about",
+        "what is this pdf about",
+        "what is the pdf about",
+        "summarize the document",
+        "summarise the document",
+        "summarize this document",
+        "summarise this document",
+        "give me a summary",
+        "give me the summary",
+        "summarize the key points",
+        "summarise the key points",
+        "main findings",
+        "main conclusions",
+        "key points of the document",
+    )
+    return any(p in q for p in phrases)
+
+
+def extract_page_request(query: str):
+    """
+    Detect explicit page references such as:
+    'page 200', 'on page 200', 'near page 200', 'pages 200-205'.
+    Returns a tuple describing the requested page range, or None.
+    """
+    q = query.lower()
+
+    range_match = re.search(r"pages?\s*(\d+)\s*(?:-|to)\s*(\d+)", q)
+    if range_match:
+        first = int(range_match.group(1))
+        last = int(range_match.group(2))
+        return ("range", min(first, last), max(first, last))
+
+    page_match = re.search(r"page\s*(?:number\s*)?(\d+)", q)
+    if page_match:
+        page = int(page_match.group(1))
+
+        if re.search(r"\bnear\b|\baround\b|\bclose to\b", q):
+            return ("near", page, page)
+
+        return ("exact", page, page)
+
+    return None
+
+
+def retrieve_by_page(query: str, vector_store: dict, top_k=TOP_K):
+    """Retrieve directly from page metadata when the user specifies pages."""
+    request = extract_page_request(query)
+
+    if not request:
+        return None
+
+    mode, first_page, last_page = request
+    total_pages = vector_store.get("total_pages", 0)
+
+    if total_pages:
+        first_page = max(1, min(first_page, total_pages))
+        last_page = max(1, min(last_page, total_pages))
+
+    if mode == "near":
+        first_page = max(1, first_page - PAGE_NEARBY)
+        last_page = min(total_pages or last_page + PAGE_NEARBY,
+                        last_page + PAGE_NEARBY)
+
+    matching = []
+
+    for idx, meta in enumerate(vector_store["meta"]):
+        page = meta["page"]
+        if first_page <= page <= last_page:
+            matching.append({
+                "text": vector_store["chunks"][idx],
+                "page": page,
+                "score": 1.0,
+            })
+
+    # For an exact page request, return every chunk from that page.
+    # For a range/near request, cap the amount of context sent to Gemini.
+    if mode == "exact":
+        return matching
+
+    return matching[:max(top_k * 2, 10)]
+
+
+def semantic_retrieve(query: str, vector_store: dict, top_k=TOP_K):
+    q_emb = embed_texts([query])
+
+    scores, idxs = vector_store["index"].search(
+        q_emb,
+        min(top_k, len(vector_store["chunks"]))
+    )
+
     results = []
+
     for score, idx in zip(scores[0], idxs[0]):
-        if idx >= 0 and score > 0.12:
+        if idx >= 0:
             results.append({
-                "text" : vector_store["chunks"][idx],
-                "page" : vector_store["meta"][idx]["page"],
+                "text": vector_store["chunks"][idx],
+                "page": vector_store["meta"][idx]["page"],
                 "score": float(score),
             })
+
+    return results
+
+
+def retrieve(query: str, vector_store: dict, client=None, top_k=TOP_K):
+    """
+    Route page-number questions to page metadata and all other questions
+    to semantic FAISS retrieval.
+    """
+    page_results = retrieve_by_page(query, vector_store, top_k)
+
+    if page_results is not None:
+        return page_results
+
+    results = semantic_retrieve(query, vector_store, top_k)
+
+    if is_overview_question(query):
+        seen = {id(result) for result in results}
+        total = len(vector_store["chunks"])
+
+        if total > 0:
+            representative_count = min(8, total)
+            representative_idxs = np.linspace(
+                0, total - 1, representative_count, dtype=int
+            )
+
+            for raw_idx in representative_idxs:
+                idx = int(raw_idx)
+                candidate = {
+                    "text": vector_store["chunks"][idx],
+                    "page": vector_store["meta"][idx]["page"],
+                    "score": None,
+                }
+
+                if not any(
+                    item["text"] == candidate["text"] for item in results
+                ):
+                    results.append(candidate)
+
     return results
 
 
@@ -228,22 +364,56 @@ def build_prompt(query: str, context_chunks: list, pdf_name: str) -> str:
     ctx = "\n\n---\n\n".join(
         f"[Page {c['page']}]\n{c['text']}" for c in context_chunks
     )
+
+    page_request = extract_page_request(query)
+
+    if page_request:
+        if page_request[0] == "exact":
+            page_instruction = (
+                f"The user explicitly asked about page {page_request[1]}. "
+                f"Use ONLY the chunks labeled Page {page_request[1]} and "
+                "answer from that page."
+            )
+        else:
+            page_instruction = (
+                "The user explicitly asked about a page or page range. "
+                "Use the supplied page-labeled chunks and identify the "
+                "relevant page numbers in the answer."
+            )
+    else:
+        page_instruction = ""
+
+    overview_instruction = (
+        "For this broad overview question, synthesize the supplied excerpts "
+        "from different parts of the document to explain its topic, purpose, "
+        "main themes, findings, or conclusions. Do not require one exact "
+        "sentence to answer the question."
+        if is_overview_question(query)
+        else
+        "Answer the user's specific question using the supplied context."
+    )
+
+    if page_instruction:
+        overview_instruction = page_instruction
+
     return f"""You are a precise document assistant. Your ONLY knowledge source is the PDF: "{pdf_name}".
 
 STRICT RULES:
-1. Answer ONLY from the context provided below — never use outside knowledge.
-2. If the answer is not in the context, respond: "I couldn't find information about that in the uploaded PDF."
-3. Cite page numbers inline when referencing information, e.g. (Page 3).
-4. Be concise, factual, and structured.
+1. {overview_instruction}
+2. Never use outside knowledge.
+3. For a page-specific question, answer from the page-labeled context supplied to you.
+4. If the supplied context genuinely does not contain enough information, respond: "I couldn't find information about that in the uploaded PDF."
+5. Cite page numbers inline whenever you use information from the document, e.g. (Page 3).
+6. Do not invent facts, names, numbers, or conclusions.
+7. Keep the answer clear, concise, and useful.
 
 === DOCUMENT CONTEXT ===
 {ctx}
-=== END CONTEXT ===
+=== END DOCUMENT CONTEXT ===
 
 USER QUESTION: {query}
 
 ANSWER:"""
-
 
 def ask_gemini(prompt: str, client) -> str:
     response = client.models.generate_content(
@@ -264,7 +434,7 @@ with st.sidebar:
     st.markdown("## 📄 PDF RAG Chatbot")
     st.markdown(
         "<div style='color:#64748b;font-size:0.82rem;margin-bottom:16px;'>"
-        "Powered by Google Gemini + FAISS</div>",
+        "Local Embeddings + Google Gemini + FAISS + Page-Aware Search</div>",
         unsafe_allow_html=True,
     )
 

@@ -1,5 +1,6 @@
-streamlit>=1.35.0
-pypdf>=4.0.0
-google-genai==2.23.0
-faiss-cpu>=1.7.4
-numpy>=1.26.0
+streamlit
+pypdf
+faiss-cpu
+numpy
+google-genai
+sentence-transformers
