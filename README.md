@@ -171,11 +171,11 @@ Through this project, I worked with:
 
 ## 👨‍💻 Author
 
-**Anurag Singh Chandel**
+**Anurag Singh Chandel** And **Anshuman Singh**
 
 B.Tech Computer Science Engineering
 
-Interested in **Data Analytics, Python, SQL, and Generative AI**.
+Interested in **Data, Python, SQL, and Generative AI**.
 
 ---
 
