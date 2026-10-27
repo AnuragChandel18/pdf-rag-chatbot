@@ -5,7 +5,8 @@ A Retrieval-Augmented Generation (RAG) chatbot that allows users to upload a PDF
 ## 🚀 Live Demo
 
 **Streamlit App:**
-[https://pdf-rag-chatbot-36yadsnlsx9fa4dzxch5e8.streamlit.app/]
+[Try Live Dashboard](https://pdf-rag-chatbot-36yadsnlsx9fa4dzxch5e8.streamlit.app/).
+
 
 ## 📌 Project Overview
 
