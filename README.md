@@ -168,7 +168,6 @@ Through this project, I worked with:
 * Gemini API integration
 * Streamlit application development
 * Deploying an AI application to the cloud
-* Managing API credentials securely
 
 ## 👨‍💻 Author
 
